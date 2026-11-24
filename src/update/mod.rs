@@ -68,12 +68,50 @@ pub(crate) fn autoupdate() -> Result<String, String> {
     let _ = fs::remove_dir_all(&work);
     fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
     let r = check(&work);
+    let own = from_self(&work);
     let _ = fs::remove_dir_all(&work);
-    match &r {
-        Ok(m) => log(&format!("autoupdate: {m}")),
-        Err(e) => log(&tf!("autoupdate: ОШИБКА {e}", "autoupdate: ERROR {e}", ja: "自動更新: エラー {e}", pt: "autoupdate: ERRO {e}", zh: "autoupdate: 错误 {e}")),
+    for r in [&r, &own] {
+        match r {
+            Ok(m) if m.is_empty() => {}
+            Ok(m) => log(&format!("autoupdate: {m}")),
+            Err(e) => log(&tf!("autoupdate: ОШИБКА {e}", "autoupdate: ERROR {e}", ja: "自動更新: エラー {e}", pt: "autoupdate: ERRO {e}", zh: "autoupdate: 错误 {e}")),
+        }
     }
-    r
+    // a new WinRust.exe was swapped in: it brings its plugins now (from_self), not at the next daily run
+    if r.as_ref().is_ok_and(|m| m.contains("WinRust.exe")) {
+        let _ = std::process::Command::new(self_exe()).arg("autoupdate").spawn();
+    }
+    r.and(own)
+}
+
+/// A release may ship WinRust.exe alone (the plugins ride inside it). Once the auto-updater has put such a release in
+/// (version.txt is this copy's own version), this copy replaces installed plugins that differ from the ones it carries,
+/// once per version (plugins.txt). A plugin updated by hand afterwards (`update`, a dev build) is left alone.
+fn from_self(work: &Path) -> Result<String, String> {
+    let own = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let read = |f: &str| fs::read_to_string(home().join(f)).map(|s| s.trim().to_string()).unwrap_or_default();
+    let me = env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    if read("version.txt") != own || read("plugins.txt") == own || me != self_exe().canonicalize().ok() {
+        return Ok(String::new());
+    }
+    let (mut done, mut errs) = (vec![], vec![]);
+    for (name, bytes) in PAYLOAD.iter() {
+        let sha = sha256_hex(bytes);
+        let stale: Vec<PathBuf> = targets(name).into_iter().filter(|t| fs::read(t).is_ok_and(|b| sha256_hex(&b) != sha)).collect();
+        if stale.is_empty() {
+            continue;
+        }
+        let tmp = work.join(name);
+        match fs::write(&tmp, bytes).map_err(|e| format!("{name}: {e}")).and_then(|_| swap_all(&tmp, &stale)) {
+            Ok(()) => done.push(*name),
+            Err(e) => errs.push(e),
+        }
+    }
+    let msg = if done.is_empty() { String::new() } else { tf!("{own}: обновлено {}", "{own}: updated {}", ja: "{own}: {} を更新しました", pt: "{own}: atualizado {}", zh: "{own}：已更新 {}", done.join(", ")) };
+    if errs.is_empty() {
+        let _ = fs::write(home().join("plugins.txt"), &own); // failed files are retried on the next run
+        Ok(msg)
+    } else { Err(format!("{msg}; {}", errs.join("; "))) }
 }
 
 /// A newer signed release than this one, found by the installer window (None until found, or when up to date).

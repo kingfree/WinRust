@@ -273,7 +273,8 @@ unsafe fn step(h: HWND) {
         (s.alpha, s.x, s.y + s.slide as i32, (W as f32 * s.scale) as i32, s.height.round() as i32, moving, gone, s.round_with_region)
     });
     SetLayeredWindowAttributes(h, 0, (alpha * 255.0).round() as u8, LWA_ALPHA);
-    SetWindowPos(h, HWND_TOPMOST, x, y, w, hgt, SWP_NOACTIVATE);
+    // no z-order change: show() put the card on top, and raising it every frame covered the IME candidate list (#138)
+    SetWindowPos(h, null_mut(), x, y, w, hgt, SWP_NOACTIVATE | SWP_NOZORDER);
     if region {
         let r = (RADIUS as f32 * st(|s| s.scale)) as i32 * 2;
         SetWindowRgn(h, CreateRoundRectRgn(0, 0, w + 1, hgt + 1, r, r), 1);
@@ -648,6 +649,22 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
                     apply_results(h, res);
                 }
             }
+            0
+        }
+        WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION => {
+            place_ime(h);
+            DefWindowProcW(h, m, wp, lp)
+        }
+        WM_ICONS => {
+            let done = std::mem::take(&mut *ICONS_DONE.lock().unwrap());
+            st(|s| {
+                for (p, i) in done {
+                    if let Some(old) = s.icons.insert(p, i).filter(|o| *o != 0 && *o != i) {
+                        DestroyIcon(old as _);
+                    }
+                }
+            });
+            InvalidateRect(h, null(), 0);
             0
         }
         WM_ERASEBKGND => 1,
@@ -1277,7 +1294,44 @@ unsafe fn icon_path(p: &str) -> String {
     if n > 0 && n < b.len() { String::from_utf16_lossy(&b[..n]) } else { e }
 }
 
-unsafe fn ensure_icons() {
+// Icons load on a worker thread: SHGetFileInfoW can hang for minutes on a cloud-only file or an offline drive,
+// and on the window thread that froze the card for good (#134). Rows show without an icon until it arrives.
+const WM_ICONS: u32 = WM_APP + 9;
+static ICONS_DONE: std::sync::Mutex<Vec<(String, isize)>> = std::sync::Mutex::new(Vec::new());
+
+/// The input row draws its own caret, so the IME is told where it is: the composition text and the candidate list
+/// then open under the typed text instead of at the card's corner, hidden by it (#138).
+unsafe fn place_ime(h: HWND) {
+    use windows_sys::Win32::UI::Input::Ime::{CANDIDATEFORM, CFS_CANDIDATEPOS, CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow};
+    let (scale, font, text) = st(|s| (s.scale, s.fonts[F_INPUT], s.text.clone()));
+    let p = |v: i32| (v as f32 * scale).round() as i32;
+    let mut rc: RECT = zeroed();
+    GetClientRect(h, &mut rc);
+    let dc = GetDC(h);
+    let old = SelectObject(dc, font as _);
+    let mut size: SIZE = zeroed();
+    GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32, &mut size);
+    SelectObject(dc, old);
+    ReleaseDC(h, dc);
+    // the same spot draw() puts the caret: the end of the text, kept inside the input area
+    let x = (p(58) + size.cx + p(2)).min(rc.right - p(24));
+    let (top, bottom) = (p(INPUT_H) / 2 - p(14), p(INPUT_H) / 2 + p(14));
+    let imc = ImmGetContext(h);
+    if imc.is_null() {
+        return;
+    }
+    let mut cf: COMPOSITIONFORM = zeroed();
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos = POINT { x, y: top };
+    ImmSetCompositionWindow(imc, &cf);
+    let mut cand: CANDIDATEFORM = zeroed();
+    cand.dwStyle = CFS_CANDIDATEPOS;
+    cand.ptCurrentPos = POINT { x, y: bottom };
+    ImmSetCandidateWindow(imc, &cand);
+    ImmReleaseContext(h, imc);
+}
+
+unsafe fn ensure_icons(h: HWND) {
     st(|s| {
         if s.icons.len() > 300 {
             for (_, i) in s.icons.drain() {
@@ -1287,23 +1341,35 @@ unsafe fn ensure_icons() {
             }
         }
     });
-    let need: Vec<String> = st(|s| s.results.iter().skip(s.top).take(MAX_ROWS).filter(|p| !s.icons.contains_key(*p)).cloned().collect());
-    for p in need {
-        let mut fi: SHFILEINFOW = zeroed();
-        let path = wide(&icon_path(&p));
-        SHGetFileInfoW(path.as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
-        if fi.hIcon.is_null() {
-            // no icon of its own (unregistered type, vanished file): the generic one for that extension
-            SHGetFileInfoW(path.as_ptr(), 0x80, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES);
-        }
-        st(|s| {
-            s.icons.insert(p, fi.hIcon as isize);
-        });
+    // a pending path is cached as 0 at once, so it is asked for only once even if its worker never returns
+    let need: Vec<String> = st(|s| {
+        let need: Vec<String> = s.results.iter().skip(s.top).take(MAX_ROWS).filter(|p| !s.icons.contains_key(*p)).cloned().collect();
+        need.iter().for_each(|p| _ = s.icons.insert(p.clone(), 0));
+        need
+    });
+    if need.is_empty() {
+        return;
     }
+    let hw = h as isize;
+    std::thread::spawn(move || unsafe {
+        use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
+        for p in need {
+            let mut fi: SHFILEINFOW = zeroed();
+            let path = wide(&icon_path(&p));
+            SHGetFileInfoW(path.as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
+            if fi.hIcon.is_null() {
+                // no icon of its own (unregistered type, vanished file): the generic one for that extension
+                SHGetFileInfoW(path.as_ptr(), 0x80, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES);
+            }
+            ICONS_DONE.lock().unwrap().push((p, fi.hIcon as isize));
+            PostMessageW(hw as HWND, WM_ICONS, 0, 0); // each icon shows as soon as it is ready
+        }
+    });
 }
 
 unsafe fn paint(h: HWND) {
-    ensure_icons();
+    ensure_icons(h);
     let v = st(|s| View {
         scale: s.scale,
         fonts: s.fonts,

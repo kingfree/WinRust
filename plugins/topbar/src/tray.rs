@@ -26,6 +26,12 @@ pub(crate) fn hide_onedrive() -> bool {
     std::env::current_exe().ok().and_then(|e| std::fs::read_to_string(e.with_file_name("topbar.cfg")).ok()).is_none_or(|c| !c.contains("hide_onedrive=0"))
 }
 
+/// Explorer's volume, network and power icons ({7820AE73/74/75-23E3-4229-82C1-E41CB67D5B9C}): the bar draws those itself.
+/// Its other icons (printer queue, Safely Remove Hardware, microphone in use) stay (#127).
+fn own_icon(guid: &[u8; 16]) -> bool {
+    matches!(guid[0], 0x73..=0x75) && guid[1..] == [0xAE, 0x20, 0x78, 0xE3, 0x23, 0x29, 0x42, 0x82, 0xC1, 0xE4, 0x1C, 0xB6, 0x7D, 0x5B, 0x9C]
+}
+
 /// WM_COPYDATA (dwData 1) from Shell_NotifyIcon: u32 magic, u32 NIM_*, then the platform-neutral NOTIFYICONDATA
 /// (32-bit handles): hWnd@12 uID@16 uFlags@20 callback@24 hIcon@28 dwState@288 mask@292 version@808 guid@944.
 pub(crate) unsafe fn tray_msg(d: &[u8]) {
@@ -47,7 +53,7 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
                     None => {
                         let exe = exe_of(h);
                         let n = exe.rsplit('\\').next().unwrap_or("");
-                        if n == "explorer.exe" || n == "topbar.exe" || (n == "onedrive.exe" && hide_onedrive()) {
+                        if (n == "explorer.exe" && own_icon(&guid)) || n == "topbar.exe" || (n == "onedrive.exe" && hide_onedrive()) {
                             return; // the system's own icons are drawn by the bar itself
                         }
                         t.push(TIcon { hwnd: h, uid, guid, icon: null_mut(), cb: 0, ver: 0, hidden: false, tip: String::new(), key: n.to_string() });

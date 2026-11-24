@@ -96,6 +96,7 @@ const ROWS: usize = 11;
 thread_local! {
     static FLY: Cell<Option<Kind>> = const { Cell::new(None) };
     static FH: Cell<HWND> = const { Cell::new(null_mut()) };
+    static DEACT: Cell<(Option<Kind>, u64)> = const { Cell::new((None, 0)) }; // panel closed by losing focus, and when
     static CAL: Cell<(i32, i32)> = const { Cell::new((2026, 1)) };
     static NETS: RefCell<Vec<Net>> = const { RefCell::new(Vec::new()) };
     static CONN: RefCell<Option<Conn>> = const { RefCell::new(None) };
@@ -918,6 +919,16 @@ unsafe fn anim_step(hw: HWND) {
     } else {
         KillTimer(hw, 3);
     }
+}
+
+/// toggle() for a click on the panel's own bar button. The click can deactivate the panel first (closing it), and a
+/// plain toggle then opened it again with its animation (#140): a panel of this kind closed that way just now stays closed.
+pub fn toggle_click(k: Kind) {
+    let (dk, t) = DEACT.replace((None, 0));
+    if dk == Some(k) && unsafe { now_ms() }.saturating_sub(t) < 400 {
+        return;
+    }
+    toggle(k);
 }
 
 pub fn toggle(k: Kind) {
@@ -1769,6 +1780,7 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             if k == Kind::Start && GetAsyncKeyState(VK_LBUTTON as i32) < 0 {
                 SetTimer(hw, 6, 150, None);
             } else {
+                DEACT.set((Some(k), now_ms()));
                 close();
             }
         }

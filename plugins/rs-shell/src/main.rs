@@ -423,7 +423,9 @@ fn bootstrap() -> bool {
     let Ok(base) = std::env::var("LOCALAPPDATA") else { return false };
     let real = PathBuf::from(base).join(r"plugin-launcher\bin\rs-shell.exe");
     let me = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
-    if !real.exists() || real.canonicalize().ok() == me {
+    let age = |p: &PathBuf| p.metadata().and_then(|m| m.modified()).ok();
+    // an older user copy is a leftover (nothing writes there any more): the installed shell runs itself
+    if !real.exists() || real.canonicalize().ok() == me || age(&real) < std::env::current_exe().ok().as_ref().and_then(age) {
         return false;
     }
     let t = Instant::now();

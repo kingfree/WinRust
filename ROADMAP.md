@@ -6,6 +6,11 @@ Each item says how far it was checked: **tests** (unit tests), **built** (compil
 
 ## Done
 
+### v0.5.8
+- **Fixes from issues:** search no longer freezes on a cloud-only or offline file (icons load on a worker thread, #134); the IME composition and candidate list open under the typed text instead of behind the search card (#138); a second click on the clock, Wi-Fi, volume or battery closes its panel instead of replaying the opening animation (#140); windows asking for attention light up their bar button until activated (#129); two pins of one exe (Firefox / Chrome profiles) keep their own windows by AppUserModelID (#132); Explorer's other tray icons (printer queue, Safely Remove Hardware, microphone in use) are shown, only volume / network / power are drawn by the bar itself (#127); the Task View button opens our window grid when Explorer is not the shell (#120); the desktop menu opens on a secondary monitor (#125, icons there still only on the primary). *built, tests; installed and started here, the IME and printer cases not tried on a live system*
+- Win+E and rs-shell no longer start leftover copies from `%LOCALAPPDATA%\plugin-launcher\bin` (an old rust-explorer without an icon opened while rust-explorer was not even installed). *ran*
+- Releases carry only `WinRust.exe` (plus the signed manifest); the auto-updater swaps it in and the new copy updates the installed plugins from the ones it carries, once per version. *built; first live run with this release*
+
 ### v0.5.7
 - **Lighter in the background:** topbar follows window events (WinEvent hooks) instead of listing every window twice a second, caches each window's app ID and icon, draws its background and fonts once instead of every frame; the 250 ms pointer watch runs only for auto-hide / dock / desktop. Idle CPU 6.3 → 0.5 ms/s. rs-launcher ends SearchHost on a window event instead of a full process refresh every 2 s (6.3 ms/s → 0, 800 → 110 handles, 12.7 → 1.4 MB private). rs-shell: no reg.exe, no snapshots (2.1 ms/s → 0). Task Manager in the tray looks every 5 s. Search index slots 12 → 10 bytes. *measured: README, Background load*
 - **Setup wizard:** the installer is a dark step-by-step wizard: Express (the recommended set, nothing removed) or Custom (check boxes, the old warnings), a progress page, a results page. *built; pages screenshot-checked except the progress page*

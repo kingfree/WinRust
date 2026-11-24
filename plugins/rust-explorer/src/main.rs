@@ -1866,8 +1866,9 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 SetFocus(list);
                 0
             }
-            // icons hidden: the list is not shown, so the click lands on the desktop itself; the menu must still open
-            WM_CONTEXTMENU if desk() && icons_hidden() => { bg_menu(h); 0 }
+            // a click on the desktop itself, not on the icon list (which has its own NM_RCLICK menu): icons hidden, or
+            // a secondary monitor, where the list does not reach (#125)
+            WM_CONTEXTMENU if desk() && (icons_hidden() || wp as HWND == h) => { bg_menu(h); 0 }
             desk::SPAWN_WORKERW if desk() => { desk::spawn_workerw(h); 0 }
             WM_TIMER if desk() && wp == 7 => { desk::check_live(ST.with_borrow(|st| st.list)); 0 }
             WM_DESTROY => { if !desk() { save_place(h); } shellwin::revoke(); PostQuitMessage(0); 0 }
