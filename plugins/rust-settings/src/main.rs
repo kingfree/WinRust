@@ -1422,7 +1422,7 @@ unsafe fn run_cmd(hwnd: HWND, label: &str, cmd: Cmd) {
                     }
                     Cmd::Wallpaper => {
                         if sys::pick_wallpaper(hwnd).is_ok() {
-                            say(t!("Обои изменены", "Wallpaper changed", ja: "壁紙を変更しました", pt: "Plano de fundo alterado").into());
+                            say(t!("Обои изменены", "Wallpaper changed", ja: "壁紙を変更しました", pt: "Plano de fundo alterado", zh: "壁纸已更改").into());
                         }
                     }
                     Cmd::EmptyBin => {

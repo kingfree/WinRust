@@ -437,7 +437,7 @@ unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 unsafe fn tip_text(h: i32) -> String {
     match h {
         SEARCH => "Search".into(),
-        TASKVIEW => t!("Представление задач", "Task View", ja: "タスク ビュー", pt: "Visão de Tarefas").into(),
+        TASKVIEW => t!("Представление задач", "Task View", ja: "タスク ビュー", pt: "Visão de Tarefas", zh: "任务视图").into(),
         0 => "Start".into(),
         TAPP => "Hidden icons".into(),
         GEAR => t!("Стиль", "Style", ja: "スタイル", pt: "Estilo", zh: "样式").into(),
@@ -2596,8 +2596,8 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         CLOCK => {
             // right click: like Windows 11, a menu with the date and time and notification settings (#126)
             let items = vec![
-                fly::MItem::new(t!("Настройка даты и времени", "Adjust date and time", ja: "日付と時刻を調整する", pt: "Ajustar data e hora")),
-                fly::MItem::new(t!("Параметры уведомлений", "Notification settings", ja: "通知の設定", pt: "Configurações de notificação")),
+                fly::MItem::new(t!("Настройка даты и времени", "Adjust date and time", ja: "日付と時刻を調整する", pt: "Ajustar data e hora", zh: "调整日期和时间")),
+                fly::MItem::new(t!("Параметры уведомлений", "Notification settings", ja: "通知の設定", pt: "Configurações de notificação", zh: "通知设置")),
             ];
             fly::menu(tip_cx(&bar_layout(BAR.load(Relaxed) as HWND), CLOCK), None, items, |i| {
                 if i == 0 {
