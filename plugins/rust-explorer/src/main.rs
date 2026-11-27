@@ -5,7 +5,8 @@
 // Ctrl+T/W/Tab tabs, Ctrl+M thumbnails, Ctrl+L/F4 address bar, Ctrl+F or "? terms" in the bar = instant search through the rs service, right click / Menu key = shell context menu.
 // Look: topbar's palette, painted tabs / toolbar / address pill and status line (src/ui.rs), dark title bar and list.
 // Clipboard is the system one (Ctrl+C/X/V interoperate with Explorer). Also: Alt+Left/Right back/forward, Alt+Up up,
-// Alt+Enter properties, F5 refresh, Ctrl+H hidden files, click a column header to sort, right click on empty space = folder menu.
+// Alt+Enter properties, F5 refresh, Ctrl+H hidden files, click a column header to sort, right click on empty space = folder menu,
+// middle click on a folder = open it in a new tab.
 // shortcuts: std::fs listing (not FindFirstFileEx large fetch), icons are extension-based (exe/lnk/ico/url/scr
 // per file) and synchronous (thumbnails: one background thread, 96px, no disk cache), internal copy/cut clipboard, silent rename errors,
 // search blocks the UI while it waits for the service (no async), the service pipe is admin-only so run as admin,
@@ -19,11 +20,12 @@
 #![windows_subsystem = "windows"]
 use std::{cell::RefCell, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}};
 use winrust_common::{t, tf};
-use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL}, Shell::*, WindowsAndMessaging::*}};
+use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{GetStockObject, InvalidateRect, ScreenToClient}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL}, Shell::*, WindowsAndMessaging::*}};
 
 mod zipx; // our own ZIP engine (deflate, inflate, container)
 mod jobs; // our own copier, ZIP packer, ZIP/7z unpacker (background, progress in the status line)
 mod shellwin; // registers the window as a shell window: "Show in folder" from other apps selects the file
+mod menu; // the folder's own menu, painted in our colours
 mod ui; // the look: palette, painted tabs / toolbar / address pill / status line, dark theme
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
@@ -121,18 +123,21 @@ static SORT_ASC: AtomicBool = AtomicBool::new(true);
 static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
 static NAV: AtomicBool = AtomicBool::new(false); // loading from the back / forward trail: do not record it again
 const WM_NAV: u32 = WM_APP + 3; // wp: 1 back, 2 forward, 3 properties, 4 up (sent from the message loop for Alt+key)
+const WM_DIRSIZE: u32 = WM_APP + 7; // folder-size worker -> UI: wp = Box<(era, folder name, bytes)> (#147)
 const WM_JOB: u32 = WM_APP + 5; // jobs.rs worker finished: wp = Box<Option<String>> (the error, if any)
 
 fn row(name: String, m: Option<&fs::Metadata>) -> Row {
     Row { name, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2, hdr: false }
 }
 
-/// Folders always first; inside each group by the column (0 name, 1 size, 2 modified), ties by name.
+/// Folders first (unless "Folders first" is off in the folder's menu, #162); inside each group by the column (0 name, 1 size, 2 modified), ties by name.
 fn sort_rows(rows: &mut [Row], col: usize, asc: bool) {
     let key = |r: &Row| r.name.rsplit('\\').next().unwrap_or("").to_lowercase();
+    let mixed = !desk() && mixed_marker().exists();
     rows.sort_by(|a, b| {
         let o = match col { 1 => a.time.cmp(&b.time), 2 => type_text(&a.name, a.dir).cmp(&type_text(&b.name, b.dir)), 3 => a.size.cmp(&b.size), _ => key(a).cmp(&key(b)) };
-        (!a.dir).cmp(&!b.dir).then(if asc { o } else { o.reverse() }).then_with(|| key(a).cmp(&key(b)))
+        let dirs = if mixed { std::cmp::Ordering::Equal } else { (!a.dir).cmp(&!b.dir) };
+        dirs.then(if asc { o } else { o.reverse() }).then_with(|| key(a).cmp(&key(b)))
     });
     // grouped by date: the groups are contiguous (the stable sort keeps the order above inside each one)
     if group_on() { bucket_refresh(); rows.sort_by_cached_key(|r| bucket(r.time)); }
@@ -159,6 +164,7 @@ thread_local! {
     static BCTX: std::cell::Cell<(i64, i64)> = const { std::cell::Cell::new((0, 0)) }; // (today's local day number, local - UTC in ticks)
 }
 
+fn mixed_marker() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join("rust-explorer").join("folders-mixed") }
 fn group_marker() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\group-by-date") }
 static THUMBS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false); // thumbnail view: no headings
 fn group_on() -> bool { !desk() && !THUMBS.load(Relaxed) && group_marker().exists() }
@@ -431,47 +437,56 @@ fn set_icons_hidden(hide: bool) {
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bg_menu(h: HWND) {
     let m = CreatePopupMenu();
-    let items = [
-        (1usize, t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹")),
-        (2, t!("Новый текстовый файл", "New text file", ja: "新しいテキスト ドキュメント", pt: "Novo arquivo de texto", zh: "新建文本文件")),
-        (3, t!("Вставить", "Paste", ja: "貼り付け", pt: "Colar", zh: "粘贴")),
-        (4, t!("Обновить", "Refresh", ja: "最新の情報に更新", pt: "Atualizar", zh: "刷新")),
-        (5, t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性")),
-    ];
-    for (id, lbl) in items { AppendMenuW(m, MF_STRING, id, w(lbl).as_ptr()); }
-    let disk = tool("wiztree");
-    if disk.is_some() { AppendMenuW(m, MF_STRING, 6, w(t!("Занятое место (WinRust Disk)", "Disk usage (WinRust Disk)", ja: "ディスク使用量 (WinRust Disk)", pt: "Uso do disco (WinRust Disk)", zh: "磁盘占用（WinRust Disk）")).as_ptr()); }
-    if desk() {
-        let sort = [
-            (8usize, t!("Упорядочить значки по имени", "Sort icons by name", ja: "名前順にアイコンを並べ替え", pt: "Classificar ícones por nome", zh: "按名称排列图标")),
-            (9, t!("Упорядочить значки по дате", "Sort icons by date", ja: "日付順にアイコンを並べ替え", pt: "Classificar ícones por data", zh: "按日期排列图标")),
-            (10, t!("Упорядочить значки по размеру", "Sort icons by size", ja: "サイズ順にアイコンを並べ替え", pt: "Classificar ícones por tamanho", zh: "按大小排列图标")),
-            (11, t!("Выровнять значки", "Arrange icons", ja: "アイコンの整列", pt: "Alinhar ícones", zh: "排列图标")),
-        ];
-        for (id, lbl) in sort { AppendMenuW(m, MF_STRING, id, w(lbl).as_ptr()); }
-    }
+    menu::item(m, 1, "\u{E8F4}", t!("Новая папка", "New folder", ja: "新しいフォルダー", pt: "Nova pasta", zh: "新建文件夹"), false);
+    menu::item(m, 2, "\u{E8A5}", t!("Новый текстовый файл", "New text file", ja: "新しいテキスト ドキュメント", pt: "Novo arquivo de texto", zh: "新建文本文件"), false);
+    menu::item(m, 3, "\u{E77F}", t!("Вставить", "Paste", ja: "貼り付け", pt: "Colar", zh: "粘贴"), false);
+    menu::sep(m);
     if !desk() {
-        let lbl = if group_on() { t!("Без группировки", "No grouping", ja: "グループ化しない", pt: "Sem agrupamento", zh: "不分组") } else { t!("Группировать по дате", "Group by date", ja: "日付でグループ化", pt: "Agrupar por data", zh: "按日期分组") };
-        AppendMenuW(m, MF_STRING, 13, w(lbl).as_ptr());
-    }
-    if desk() {
+        let sort = CreatePopupMenu();
+        let (col, asc) = (SORT_COL.load(Relaxed), SORT_ASC.load(Relaxed));
+        // columns of sort_rows: 0 name, 1 modified, 2 type, 3 size
+        let cols = [
+            (0usize, "\u{E8D2}", t!("По имени", "Name", ja: "名前", pt: "Nome", zh: "名称")),
+            (1, "\u{E787}", t!("По дате изменения", "Date modified", ja: "更新日時", pt: "Data de modificação", zh: "修改日期")),
+            (2, "\u{E7C3}", t!("По типу", "Type", ja: "種類", pt: "Tipo", zh: "类型")),
+            (3, "\u{E9D9}", t!("По размеру", "Size", ja: "サイズ", pt: "Tamanho", zh: "大小")),
+        ];
+        for (c, glyph, lbl) in cols { menu::item(sort, 20 + c, glyph, lbl, col == c); }
+        menu::sep(sort);
+        menu::item(sort, 30, "\u{E74A}", t!("По возрастанию", "Ascending", ja: "昇順", pt: "Crescente", zh: "升序"), asc);
+        menu::item(sort, 31, "\u{E74B}", t!("По убыванию", "Descending", ja: "降順", pt: "Decrescente", zh: "降序"), !asc);
+        menu::sep(sort);
+        menu::item(sort, 14, "\u{E8B7}", t!("Папки сверху", "Folders first", ja: "フォルダーを先頭に表示", pt: "Pastas primeiro", zh: "文件夹优先"), !mixed_marker().exists());
+        menu::submenu(m, "\u{E8CB}", t!("Сортировка", "Sort by", ja: "並べ替え", pt: "Classificar por", zh: "排序方式"), sort);
+        menu::item(m, 13, "\u{E81C}", t!("Группировать по дате", "Group by date", ja: "日付でグループ化", pt: "Agrupar por data", zh: "按日期分组"), group_on());
+    } else {
+        menu::item(m, 8, "\u{E8D2}", t!("Упорядочить значки по имени", "Sort icons by name", ja: "名前順にアイコンを並べ替え", pt: "Classificar ícones por nome", zh: "按名称排列图标"), false);
+        menu::item(m, 9, "\u{E787}", t!("Упорядочить значки по дате", "Sort icons by date", ja: "日付順にアイコンを並べ替え", pt: "Classificar ícones por data", zh: "按日期排列图标"), false);
+        menu::item(m, 10, "\u{E9D9}", t!("Упорядочить значки по размеру", "Sort icons by size", ja: "サイズ順にアイコンを並べ替え", pt: "Classificar ícones por tamanho", zh: "按大小排列图标"), false);
+        menu::item(m, 11, "\u{E80A}", t!("Выровнять значки", "Arrange icons", ja: "アイコンの整列", pt: "Alinhar ícones", zh: "排列图标"), false);
         let lbl = if small_marker().exists() { t!("Крупные значки", "Large icons", ja: "大きいアイコン", pt: "Ícones grandes", zh: "大图标") } else { t!("Мелкие значки", "Small icons", ja: "小さいアイコン", pt: "Ícones pequenos", zh: "小图标") };
-        AppendMenuW(m, MF_STRING, 12, w(lbl).as_ptr());
-    }
-    if desk() {
+        menu::item(m, 12, "\u{E8A9}", lbl, false);
         let lbl = if icons_hidden() { t!("Показать значки рабочего стола", "Show desktop icons", ja: "デスクトップ アイコンを表示", pt: "Mostrar ícones da área de trabalho", zh: "显示桌面图标") } else { t!("Скрыть значки рабочего стола", "Hide desktop icons", ja: "デスクトップ アイコンを非表示", pt: "Ocultar ícones da área de trabalho", zh: "隐藏桌面图标") };
-        AppendMenuW(m, MF_STRING, 7, w(lbl).as_ptr());
+        menu::item(m, 7, "\u{E7B3}", lbl, false);
     }
-    let mut pt: POINT = std::mem::zeroed();
-    GetCursorPos(&mut pt);
-    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
-    DestroyMenu(m);
+    menu::sep(m);
+    menu::item(m, 4, "\u{E72C}", t!("Обновить", "Refresh", ja: "最新の情報に更新", pt: "Atualizar", zh: "刷新"), false);
+    let disk = tool("wiztree");
+    if disk.is_some() { menu::item(m, 6, "\u{EDA2}", t!("Занятое место (WinRust Disk)", "Disk usage (WinRust Disk)", ja: "ディスク使用量 (WinRust Disk)", pt: "Uso do disco (WinRust Disk)", zh: "磁盘占用（WinRust Disk）"), false); }
+    menu::item(m, 5, "\u{E946}", t!("Свойства", "Properties", ja: "プロパティ", pt: "Propriedades", zh: "属性"), false);
+    let id = menu::track(h, m);
     let dir = cur_dir();
     match id {
         7 => set_icons_hidden(!icons_hidden()),
+        20..=23 => SORT_COL.store(id as usize - 20, Relaxed), // the reload below sorts again
+        30 | 31 => SORT_ASC.store(id == 30, Relaxed),
         13 => {
             let k = group_marker();
             if group_on() { let _ = fs::remove_file(&k); } else { if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&k, "1"); }
+        }
+        14 => {
+            let k = mixed_marker();
+            if k.exists() { let _ = fs::remove_file(&k); } else { if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&k, "1"); }
         }
         12 => { // the grid changes with the size: icons are laid out again
             let k = small_marker();
@@ -586,6 +601,15 @@ fn shown_name(name: &str, desktop: bool) -> String {
     if lower.ends_with(".lnk") || lower.ends_with(".url") { file[..file.len() - 4].to_string() } else { file }
 }
 
+/// Type-ahead of the virtual list (LVN_ODFINDITEM): the first row at or after `start` whose name begins with `typed`, wrapping
+/// round to the top. Case is ignored; `name_at(i)` is None for the date-group heading rows, which are never a match. A list
+/// with LVS_OWNERDATA asks us because it has no items of its own to search: unanswered, it always lands on the first row.
+fn find_row(len: usize, start: usize, typed: &str, name_at: impl Fn(usize) -> Option<String>) -> Option<usize> {
+    let typed = typed.to_lowercase();
+    if typed.is_empty() || len == 0 { return None; }
+    (0..len).map(|k| (start.min(len) + k) % len).find(|&i| name_at(i).is_some_and(|n| n.to_lowercase().starts_with(&typed)))
+}
+
 fn label(dir: &PathBuf) -> String {
     dir.file_name().map_or_else(|| dir.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
 }
@@ -637,6 +661,7 @@ fn load(h: HWND, dir: PathBuf) {
     reset_thumbs();
     put(list, LVM_DELETEALLITEMS, 0, 0);
     if desk() { desk::fill(list, n); } else { put(list, LVM_SETITEMCOUNT, n, 0); }
+    folder_sizes(h, dir, ST.with_borrow(|st| st.rows.iter().filter(|r| r.dir && !r.hdr).map(|r| r.name.clone()).collect()));
 }
 
 /// Asks the rust-search service of drive `d` (see plugins/rust-search): terms in, one path per line out.
@@ -728,6 +753,35 @@ fn reset_thumbs() {
     unsafe { ImageList_Remove(himl as _, -1) };
 }
 
+/// Bytes under `p`, not following junctions or symlinks (they point elsewhere, often back up the tree); stops when `stale`.
+fn tree_size(p: &std::path::Path, stale: &dyn Fn() -> bool) -> u64 {
+    const REPARSE: u32 = 0x400; // FILE_ATTRIBUTE_REPARSE_POINT
+    let Ok(rd) = fs::read_dir(p) else { return 0 };
+    let mut n = 0;
+    for e in rd.flatten() {
+        if stale() { return n; }
+        let Ok(m) = e.metadata() else { continue };
+        if m.file_attributes() & REPARSE != 0 { continue; }
+        n += if m.is_dir() { tree_size(&e.path(), stale) } else { m.len() };
+    }
+    n
+}
+
+/// Fills the Size column of the folders in `dir` in the background, one folder at a time; a new listing stops it.
+/// shortcut: walks with read_dir (no MFT, no cache); a drive root is skipped because that walk is the whole disk.
+fn folder_sizes(h: HWND, dir: PathBuf, names: Vec<String>) {
+    if desk() || dir.parent().is_none() || names.is_empty() { return; }
+    let (era, hw) = (GEN.load(Relaxed), h as usize);
+    std::thread::spawn(move || {
+        let stale = || GEN.load(Relaxed) != era;
+        for name in names {
+            let n = tree_size(&dir.join(&name), &stale);
+            if stale() { return; }
+            unsafe { PostMessageW(hw as HWND, WM_DIRSIZE, Box::into_raw(Box::new((era, name, n))) as usize, 0) };
+        }
+    });
+}
+
 fn reload(h: HWND) { load(h, cur_dir()); }
 
 /// (list, current dir, full paths of the selected rows)
@@ -755,6 +809,12 @@ fn col(list: HWND, i: i32, text: &str, width: i32, right: bool) {
 fn tab_new() {
     let tab = ST.with_borrow_mut(|st| { st.tabs.push(st.dir.clone()); st.active = st.tabs.len() - 1; st.tab });
     tab_text(tab, 0, "", true);
+}
+
+/// Opens `dir` in a new tab, staying on the current one (middle click on a folder row).
+fn tab_open(dir: PathBuf) {
+    let tab = ST.with_borrow_mut(|st| { st.tabs.push(dir); st.tab });
+    tab_text(tab, 0, "", true); // insert: the bar repaints with the new tab, the listing stays
 }
 
 fn tab_select(h: HWND, i: usize) {
@@ -1614,6 +1674,21 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             }
             // mouse buttons 4 / 5 (and keyboard media keys) arrive as APPCOMMAND_BROWSER_BACKWARD / _FORWARD
             0x0319 if !desk() && matches!((lp >> 16) & 0x7FF, 1 | 2) => { nav(h, (lp >> 16) & 0x7FF == 1); 1 }
+            // the list reports its button downs here: middle click on a folder row opens it in a new tab
+            WM_PARENTNOTIFY if !desk() && (wp & 0xFFFF) as u32 == WM_MBUTTONDOWN => {
+                let list = ST.with_borrow(|st| st.list);
+                let mut pt: POINT = std::mem::zeroed();
+                GetCursorPos(&mut pt);
+                if WindowFromPoint(pt) == list {
+                    ScreenToClient(list, &mut pt);
+                    let mut ht: LVHITTESTINFO = std::mem::zeroed();
+                    ht.pt = pt;
+                    let i = put(list, LVM_SUBITEMHITTEST, 0, &mut ht as *mut _ as isize);
+                    let dir = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).filter(|r| r.dir && !r.hdr).map(|r| st.dir.join(&r.name)));
+                    if let Some(d) = dir { tab_open(d); }
+                }
+                0
+            }
             WM_SIZE => {
                 let list = ST.with_borrow(|st| st.list);
                 let (cw, ch) = ((lp & 0xFFFF) as i32, ((lp >> 16) & 0xFFFF) as i32);
@@ -1664,6 +1739,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 wp.flags |= SWP_NOACTIVATE;
                 0
             }
+            WM_DRAWITEM | WM_MEASUREITEM if menu::message(h, m, lp) => 1,
             WM_INITMENUPOPUP if sh::menu_msg(m, wp, lp) => 0,
             WM_DRAWITEM | WM_MEASUREITEM if sh::menu_msg(m, wp, lp) => 1,
             WM_NOTIFY => {
@@ -1694,7 +1770,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             let Some(i) = usize::try_from(it.iItem).ok() else { return };
                             let Some(r) = rows.get_mut(i) else { return };
                             if it.mask & LVIF_TEXT != 0 && it.cchTextMax > 0 {
-                                let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem { 0 => shown_name(&r.name, desk()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) } };
+                                let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem { 0 => shown_name(&r.name, desk()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir && r.size == 0 => String::new(), _ => size_text(r.size) } };
                                 let u: Vec<u16> = s.encode_utf16().take(it.cchTextMax as usize - 1).collect();
                                 ptr::copy_nonoverlapping(u.as_ptr(), it.pszText, u.len());
                                 *it.pszText.add(u.len()) = 0;
@@ -1712,10 +1788,27 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             }
                         });
                     }
+                    LVN_ODFINDITEMW if nm.hwndFrom == list => {
+                        // typing a name in the list selects the matching row (#130); -1 = no match, the selection stays
+                        let f = &*(lp as *const NMLVFINDITEMW);
+                        if f.lvfi.flags & LVFI_STRING == 0 || f.lvfi.psz.is_null() { return -1; }
+                        let mut n = 0;
+                        while *f.lvfi.psz.add(n) != 0 { n += 1; }
+                        let typed = String::from_utf16_lossy(std::slice::from_raw_parts(f.lvfi.psz, n));
+                        let start = usize::try_from(f.iStart).unwrap_or(0);
+                        let hit = ST.with(|c| c.try_borrow().ok().and_then(|st| {
+                            find_row(st.rows.len(), start, &typed, |i| st.rows.get(i).filter(|r| !r.hdr).map(|r| shown_name(&r.name, desk())))
+                        }));
+                        return hit.map_or(-1, |i| i as LRESULT);
+                    }
                     LVN_ITEMACTIVATE => {
                         let i = (*(lp as *const NMITEMACTIVATE)).iItem;
                         let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).filter(|r| !r.hdr).map(|r| (st.dir.join(&r.name), r.dir)));
                         if let Some((p, is_dir)) = hit { activate(h, p, is_dir); }
+                    }
+                    // a double click on empty space goes up one folder, like QTTabBar (#139); not on the desktop
+                    NM_DBLCLK if nm.hwndFrom == list && !desk() && (*(lp as *const NMITEMACTIVATE)).iItem < 0 => {
+                        PostMessageW(h, WM_NAV, 4, 0);
                     }
                     NM_RCLICK if nm.hwndFrom == list => {
                         let (_, dir, paths) = selected();
@@ -1837,6 +1930,14 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     2 => nav(h, false),
                     3 => { let (_, dir, sel) = selected(); properties(&sel.first().cloned().unwrap_or(dir)); }
                     _ => if let Some(p) = cur_dir().parent() { load(h, p.to_path_buf()) },
+                }
+                0
+            }
+            WM_DIRSIZE => {
+                let (era, name, n) = *Box::from_raw(wp as *mut (u32, String, u64));
+                if era == GEN.load(Relaxed) {
+                    let (list, row) = ST.with_borrow_mut(|st| (st.list, st.rows.iter_mut().position(|r| r.dir && r.name == name).inspect(|&i| st.rows[i].size = n)));
+                    if let Some(i) = row { put(list, LVM_REDRAWITEMS, i, i as isize); }
                 }
                 0
             }
@@ -1965,6 +2066,22 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typing_a_name_finds_the_row_not_the_first_one() {
+        let rows = [None, Some("Apps"), Some("Documentos"), Some("docs.txt"), None, Some("Música"), Some("zip")];
+        let at = |i: usize| rows[i].map(str::to_string);
+        let find = |start, typed| super::find_row(rows.len(), start, typed, at);
+        assert_eq!(find(0, "z"), Some(6)); // used to land on row 0
+        assert_eq!(find(0, "DOC"), Some(2)); // case is ignored
+        assert_eq!(find(3, "doc"), Some(3)); // the search starts at the given row ...
+        assert_eq!(find(4, "doc"), Some(2)); // ... and wraps round to the top
+        assert_eq!(find(0, "mú"), Some(5)); // accents are plain characters
+        assert_eq!(find(0, "x"), None); // no match: the selection stays
+        assert_eq!(find(0, ""), None);
+        assert_eq!(find(99, "a"), Some(1)); // a stale start row is clamped
+        assert_eq!(super::find_row(0, 0, "a", |_| None), None);
+    }
+
     #[test]
     fn window_place_parses_and_rejects_junk() {
         let (max, r) = super::parse_place("max 10 20 1010 680").unwrap();

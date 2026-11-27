@@ -86,7 +86,32 @@ pub(crate) unsafe fn tray_msg(d: &[u8]) {
     });
 }
 
+/// What ITaskbarList asks of the task band, applied to `skip`: DeleteTab (HSHELL_WINDOWDESTROYED for a window that lives
+/// on) takes the window's button away, AddTab (HSHELL_WINDOWCREATED) gives it back. Closed windows are forgotten.
+/// true = the window's button comes or goes.
+fn taskband(skip: &mut Vec<HWND>, code: WPARAM, w: HWND, alive: impl Fn(HWND) -> bool) -> bool {
+    skip.retain(|&x| alive(x));
+    let had = skip.contains(&w);
+    match code {
+        2 if !had && alive(w) => skip.push(w),
+        1 if had => skip.retain(|&x| x != w),
+        _ => return false,
+    }
+    true
+}
+
 pub(crate) unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg != 0 && msg == SH_MSG.get() {
+        // ITaskbarList on the task band we named in TaskbandHWND. Tauri's skipTaskbar works this way, and Tauri sends it again
+        // when the bar announces itself (TaskbarCreated), so a restarted bar learns it too.
+        if SKIP.with_borrow_mut(|s| taskband(s, wp, lp as HWND, |x| IsWindow(x) != 0)) {
+            let bar = BAR.load(Relaxed) as HWND;
+            if !bar.is_null() && !WIN_DIRTY.replace(true) {
+                SetTimer(bar, 8, 30, None);
+            }
+        }
+        return 0;
+    }
     if msg == WM_COPYDATA {
         let c = &*(lp as *const Cds);
         if c.dw == 1 && c.cb >= 964 {
@@ -169,6 +194,29 @@ pub(crate) fn toggle_shown(key: &str) {
     }
     let _ = std::fs::write(appdata_file("topbar-tray.txt"), cur.join("\n"));
     SHOWN.set(Some(cur));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_tab_hides_and_add_tab_brings_back() {
+        let (a, b, gone) = (1 as HWND, 2 as HWND, 3 as HWND);
+        let alive = |x: HWND| x != gone;
+        let mut skip = vec![];
+        assert!(taskband(&mut skip, 2, a, alive)); // DeleteTab
+        assert!(!taskband(&mut skip, 2, a, alive)); // again (Tauri repeats it on TaskbarCreated): nothing new
+        assert!(!taskband(&mut skip, 1, b, alive)); // AddTab of a window that kept its button
+        assert!(!taskband(&mut skip, 2, gone, alive)); // a closed window
+        assert!(!taskband(&mut skip, 4, a, alive)); // ActivateTab and the rest change nothing
+        assert_eq!(skip, [a]);
+        assert!(taskband(&mut skip, 1, a, alive)); // AddTab
+        assert!(skip.is_empty());
+        skip.push(gone);
+        assert!(!taskband(&mut skip, 1, b, alive));
+        assert!(skip.is_empty(), "closed windows are forgotten");
+    }
 }
 
 // ---------- tray overflow flyout (the chevron): every icon, click / right click work as in the real tray ----------

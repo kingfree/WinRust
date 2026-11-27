@@ -357,11 +357,14 @@ impl App {
             g.text(R::new(bx, by + g.px(18.0), bx + colw + g.px(10.0), by + g.px(48.0)), value, Font::Big, th.text);
             bx += colw + g.px(20.0);
         }
-        let rx = (m.l + cols as i32 * (colw + g.px(20.0)) + g.px(40.0)).max(m.r - g.px(520.0));
-        let mut ry = y;
+        // the facts go right of the stats when there is room, otherwise below them: in a narrow window the value
+        // column used to start past the right edge and showed nothing (#170)
+        let stats_r = m.l + cols as i32 * (colw + g.px(20.0)) + g.px(40.0);
+        let (rx, mut ry) = if m.r - stats_r >= g.px(380.0) { (stats_r.max(m.r - g.px(520.0)), y) } else { (m.l, by + g.px(66.0)) };
+        let kw = g.px(230.0).min((m.r - rx) * 3 / 5);
         for (k, v) in &it.facts {
-            g.text(R::new(rx, ry, rx + g.px(230.0), ry + g.px(22.0)), k, Font::Small, th.dim);
-            g.text(R::new(rx + g.px(230.0), ry, m.r, ry + g.px(22.0)), v, Font::Small, th.text);
+            g.text(R::new(rx, ry, rx + kw, ry + g.px(22.0)), k, Font::Small, th.dim);
+            g.text(R::new(rx + kw, ry, m.r, ry + g.px(22.0)), v, Font::Small, th.text);
             ry += g.px(22.0);
         }
     }

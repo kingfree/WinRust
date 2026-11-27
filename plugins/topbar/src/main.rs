@@ -20,6 +20,7 @@ extern crate winrust_common;
 use winrust_common as i18n;
 use winrust_common::style::{Style, card, on_accent, pal, rgb, style, ui_face};
 mod clip;
+mod hist;
 mod fly;
 mod quick;
 mod tray;
@@ -135,6 +136,8 @@ const TAPP: i32 = -1000;
 const SHOWDESK: i32 = -13; // the thin strip right of the clock: show desktop (#87)
 const GEAR: i32 = -12; // the gear at the left end: the Style menu
 const GEAR_X: (i32, i32) = (6, 36); // its left edge and width, before scaling (sc() is applied where used)
+const POW_R: i32 = -15; // Restart button next to the clock (#173)
+const POW_S: i32 = -16; // Shut down button
 const SYS_GRP: i32 = -11; // hover key of the one pill around wifi + volume + battery (they open the same panel)
 const WIN_START: u32 = WM_APP + 10; // posted by the keyboard hook: Win key pressed alone
 const ALT_TAB: u32 = WM_APP + 11; // posted by the keyboard hook: Alt+Tab (wp 1 = Shift held: backwards)
@@ -148,6 +151,7 @@ const WIN_NUM: u32 = WM_APP + 15; // posted by the keyboard hook: Win+1..9 (wp 0
 const WIN_X: u32 = WM_APP + 17; // posted by the keyboard hook: Win+X = our power-user menu (start_menu)
 const NEXT_LANG: u32 = WM_APP + 16; // posted by the keyboard hook: Win+Space with no explorer (wp 1 = Shift held: previous layout)
 const VOLKEY: u32 = WM_APP + 14; // posted by the keyboard hook: a volume key (wp 0 up, 1 down, 2 mute)
+const WIN_V: u32 = WM_APP + 18; // posted by the keyboard hook: Win+V with no explorer (our clipboard history, #171)
 const SNIP: u32 = WM_APP + 13; // posted by the keyboard hook: PrtSc / Win+Shift+S with no explorer to handle them
 static EXPLORER_UP: AtomicBool = AtomicBool::new(true); // explorer's taskbar exists (it handles PrtSc itself then); refreshed by the bar
 
@@ -216,6 +220,7 @@ fn lnk_uses(lnk: &std::path::Path) -> u32 {
 
 thread_local! {
     static HOST: Cell<HWND> = const { Cell::new(null_mut()) };
+    static SKIP: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // windows their app took off the taskbar (ITaskbarList::DeleteTab)
     static TIPWND: Cell<HWND> = const { Cell::new(null_mut()) };
     static SWWND: Cell<HWND> = const { Cell::new(null_mut()) }; // the Alt+Tab switcher
     static SW: RefCell<(Vec<HWND>, usize)> = const { RefCell::new((Vec::new(), 0)) }; // its windows (z-order) and selection
@@ -440,6 +445,8 @@ unsafe fn tip_text(h: i32) -> String {
     match h {
         SEARCH => "Search".into(),
         TASKVIEW => t!("Представление задач", "Task View", ja: "タスク ビュー", pt: "Visão de Tarefas", zh: "任务视图").into(),
+        POW_R => t!("Перезагрузка", "Restart", ja: "再起動", pt: "Reiniciar", zh: "重启").into(),
+        POW_S => t!("Завершение работы", "Shut down", ja: "シャットダウン", pt: "Desligar", zh: "关机").into(),
         0 => "Start".into(),
         TAPP => "Hidden icons".into(),
         GEAR => t!("Стиль", "Style", ja: "スタイル", pt: "Estilo", zh: "样式").into(),
@@ -522,6 +529,15 @@ unsafe fn show_tip(s: String, cx: i32) {
 thread_local! {
     static SW_MON: Cell<RECT> = const { Cell::new(RECT { left: 0, top: 0, right: 0, bottom: 0 }) }; // the monitor it is shown on
     static SW_CARDS: RefCell<(Vec<RECT>, Vec<isize>)> = const { RefCell::new((Vec::new(), Vec::new())) }; // card rects, DWM previews
+    // where the pointer was when the switcher opened: a window appearing under a still pointer gets a WM_MOUSEMOVE,
+    // which must not pick the card under it (#183, #116); None once the pointer really moved
+    static SW_PT: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
+}
+
+unsafe fn cursor() -> (i32, i32) {
+    let mut p: POINT = zeroed();
+    GetCursorPos(&mut p);
+    (p.x, p.y)
 }
 
 unsafe fn alt_tab(back: bool) {
@@ -550,6 +566,7 @@ unsafe fn alt_tab(back: bool) {
         }
         SW.set((v, if n == 1 { 0 } else if back { n - 1 } else { 1 }));
         SW_MON.set(mon);
+        SW_PT.set(Some(cursor()));
         sw_layout(sw);
     } else {
         SW.with_borrow_mut(|(v, i)| *i = if back { (*i + v.len() - 1) % v.len() } else { (*i + 1) % v.len() });
@@ -619,6 +636,10 @@ unsafe extern "system" fn sw_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSEACTIVATE => return MA_NOACTIVATE as isize,
         // the pointer picks a card, a click switches to it, a middle click or × closes it, the wheel steps through
         WM_MOUSEMOVE => {
+            if SW_PT.get().is_some_and(|p| p == cursor()) {
+                return 0;
+            }
+            SW_PT.set(None);
             if let Some(k) = at() {
                 if SW.with_borrow_mut(|(_, i)| std::mem::replace(i, k)) != k {
                     InvalidateRect(hwnd, null(), 0);
@@ -831,7 +852,8 @@ unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> i32 {
     let mut cls = [0u16; 32];
     let n = GetClassNameW(h, cls.as_mut_ptr(), 32) as usize;
     let ours = String::from_utf16_lossy(&cls[..n]) == "topbar";
-    if IsWindowVisible(h) != 0 && GetWindow(h, GW_OWNER).is_null() && cloaked == 0 && !ours && GetWindowTextLengthW(h) > 0 && (ex & WS_EX_TOOLWINDOW == 0 || ex & WS_EX_APPWINDOW != 0) {
+    let skipped = SKIP.with_borrow(|s| s.contains(&h));
+    if IsWindowVisible(h) != 0 && GetWindow(h, GW_OWNER).is_null() && cloaked == 0 && !ours && GetWindowTextLengthW(h) > 0 && (ex & WS_EX_TOOLWINDOW == 0 || ex & WS_EX_APPWINDOW != 0) && !skipped {
         (*(lp as *mut Vec<HWND>)).push(h);
     }
     1
@@ -1196,14 +1218,29 @@ unsafe fn load_pins() {
     }
 }
 
+/// The exe the File Explorer pin stands for (lower-case): its icon location, "%windir%\explorer.exe".
+fn file_explorer_exe() -> String {
+    expand_env(r"%windir%\explorer.exe").to_lowercase()
+}
+
+/// The windows of WinRust's file manager belong to the File Explorer pin when there is one: that pin is what the user clicks
+/// to open "Explorer" here, and only windows of explorer.exe matched it, so its button never showed them (a minimized
+/// window looked gone and the click started a second one). Without such a pin they keep their own exe's button.
+fn as_pinned_exe(exe: &str, explorer: &str, explorer_pinned: bool) -> String {
+    if explorer_pinned && exe.ends_with(r"\rust-explorer\rust-explorer.exe") { explorer.to_string() } else { exe.to_string() }
+}
+
 fn refresh_buttons() {
     let mut wins: Vec<HWND> = Vec::new();
     unsafe { EnumWindows(Some(collect), &mut wins as *mut _ as LPARAM) };
     let mut btns = vec![Btn { pin: None, wins: vec![], icon: null_mut() }];
     PINS.with_borrow(|pins| btns.extend((0..pins.len()).map(|i| Btn { pin: Some(i), wins: vec![], icon: null_mut() })));
     let mut loose: Vec<HWND> = Vec::new();
+    let explorer = file_explorer_exe();
+    let explorer_pinned = PINS.with_borrow(|p| p.iter().any(|p| p.target == explorer));
     for w in wins {
         let exe = unsafe { exe_of(w) };
+        let exe = as_pinned_exe(&exe, &explorer, explorer_pinned);
         // pins of one exe (two browser profiles, #132) tell their windows apart by AppUserModelID; a pin or window without one
         // takes any window of its exe
         let pin = PINS.with_borrow(|p| {
@@ -1327,10 +1364,39 @@ fn refresh_status() {
 
 // ---------- layout / hit-testing ----------
 
+// ---------- Restart and Shut down on the bar (#173): one pill between the system group and the clock ----------
+
+const POWER_KEYS: [i32; 2] = [POW_R, POW_S];
+
+/// Restart or shut down after a confirmation, so a stray click does not end the session.
+unsafe fn power_click(key: i32) {
+    let (q, arg) = if key == POW_R {
+        (t!("Перезагрузить компьютер?", "Restart the computer?", ja: "コンピューターを再起動しますか?", pt: "Reiniciar o computador?", zh: "要重启计算机吗？"), "/r")
+    } else {
+        (t!("Выключить компьютер?", "Shut down the computer?", ja: "コンピューターをシャットダウンしますか?", pt: "Desligar o computador?", zh: "要关闭计算机吗？"), "/s")
+    };
+    if MessageBoxW(BAR.load(Relaxed) as HWND, wide(q).as_ptr(), wide("WinRust").as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES {
+        let _ = Command::new("shutdown.exe").args([arg, "/t", "0"]).creation_flags(NO_WINDOW).spawn();
+    }
+}
+
+/// Draws the power buttons; `cell(start, len)` is the button's rectangle along the bar.
+unsafe fn paint_power(dc: HDC, l: &Layout, hot: i32, f_glyph: HFONT, cell: impl Fn(i32, i32) -> RECT) {
+    let pill = cell(l.power.0, l.power.1 - l.power.0);
+    fill(dc, pill, mix(pal().bg, pal().hover, 0.6), sc(8));
+    SelectObject(dc, f_glyph);
+    for (i, k) in POWER_KEYS.into_iter().enumerate() {
+        let rc = cell(l.power.0 + i as i32 * sc(32), sc(32));
+        glow(dc, k, hot == k, rc, mix(pal().bg, pal().hover, 0.6), mix(pal().hover, pal().accent, 0.35), sc(8));
+        text(dc, if k == POW_R { "\u{E777}" } else { "\u{E7E8}" }, rc, pal().text, DT_CENTER);
+    }
+}
+
 struct Layout {
     x0: i32, // first slot: the search button; Start and the rest follow
     bw: i32,
     gap: i32,
+    power: (i32, i32),
     apps: (i32, i32),
     sys: (i32, i32),
     clock: (i32, i32),
@@ -1339,7 +1405,8 @@ struct Layout {
 fn layout(w: i32) -> Layout {
     let gap = sc(4);
     let clock = (w - sc(96), w - sc(6));
-    let sys = (clock.0 - sc(4) - sc(150 + if BAT.get().0 >= 0 { 66 } else { 0 }), clock.0 - sc(4));
+    let power = (clock.0 - sc(4) - sc(32) * POWER_KEYS.len() as i32, clock.0 - sc(4));
+    let sys = (power.0 - sc(4) - sc(150 + if BAT.get().0 >= 0 { 66 } else { 0 }), power.0 - sc(4));
     let apps = (sys.0 - sc(24) * tray_count() as i32, sys.0);
     let margin = (w - apps.0) + sc(8); // keep the button group centered and clear of both sides
     let n = BTNS.with_borrow(|b| b.len()) as i32 + LEAD; // + the search and Task View slots
@@ -1349,7 +1416,7 @@ fn layout(w: i32) -> Layout {
     // ...but never so far right that the windows' buttons run into the tray: then the whole row shifts left
     let right_limit = w - margin - (n * (bw + gap) - gap);
     let centered = (w - (fixed * (bw + gap) - gap)) / 2;
-    Layout { x0: if i18n::style::align_left() { 0 } else { centered }.min(right_limit).max(sc(GEAR_X.0 + GEAR_X.1 + 6)), bw, gap, apps, sys, clock } // clear of the gear
+    Layout { x0: if i18n::style::align_left() { 0 } else { centered }.min(right_limit).max(sc(GEAR_X.0 + GEAR_X.1 + 6)), bw, gap, power, apps, sys, clock } // clear of the gear
 }
 
 unsafe fn hit(hwnd: HWND, x: i32, y: i32) -> i32 {
@@ -1365,6 +1432,9 @@ unsafe fn hit(hwnd: HWND, x: i32, y: i32) -> i32 {
     }
     if x >= l.clock.0 {
         return CLOCK;
+    }
+    if x >= l.power.0 {
+        return POWER_KEYS.get(((x - l.power.0) / sc(32)) as usize).copied().unwrap_or(NONE);
     }
     if x >= l.sys.0 {
         let d = x - l.sys.0;
@@ -1819,6 +1889,7 @@ unsafe fn paint_vert(dc: HDC, cr: RECT, fonts: [HFONT; 4]) {
         }
     });
 
+    paint_power(dc, &l, hot, f_glyph, cell);
     glow(dc, LANG, hot == LANG, cell(l.sys.0, sc(42)), pal().bg, pal().hover, sc(8));
     let grp = cell(l.sys.0 + sc(44), l.sys.1 - l.sys.0 - sc(44));
     let (tg, pg) = (hv(SYS_GRP, matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick)), press_t(WIFI_I).max(press_t(VOL_I)).max(press_t(BAT_I)));
@@ -2045,6 +2116,7 @@ unsafe fn paint(hwnd: HWND) {
     });
 
     // system group: language on its own, then one pill for wifi + volume + battery (like Windows 11: they open one panel)
+    paint_power(dc, &l, hot, f_glyph, |s, len| RECT { left: s, top, right: s + len, bottom: bot });
     let tb = RECT { left: l.sys.0, top, right: l.sys.1, bottom: bot };
     glow(dc, LANG, hot == LANG, RECT { left: tb.left, top, right: tb.left + sc(42), bottom: bot }, pal().bg, pal().hover, sc(8));
     let grp = RECT { left: tb.left + sc(44), top, right: tb.right, bottom: bot };
@@ -2111,6 +2183,15 @@ unsafe fn keys(vks: &[u16]) {
     };
     vks.iter().for_each(|&v| send(v, false));
     vks.iter().rev().for_each(|&v| send(v, true));
+}
+
+/// Releases `vk` alone: a swallowed key-up handed back to the shell as a synthetic one (see `run::kb_hook`).
+unsafe fn key_up(vk: u16) {
+    let mut i: INPUT = zeroed();
+    i.r#type = INPUT_KEYBOARD;
+    i.Anonymous.ki.wVk = vk;
+    i.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &i, size_of::<INPUT>() as i32);
 }
 
 /// WM_CLOSE. A window of an elevated app ignores it from our normal-rights process (UIPI), so then
@@ -2536,8 +2617,27 @@ unsafe fn start_menu() {
 /// Puts the open, not minimized windows side by side in the work area.
 /// A window dropped with the pointer on the screen edge snaps (Windows 11 style): left / right edge = that half of the monitor's
 /// work area, top edge = maximized. Only resizable windows; without Explorer nothing else does this.
-unsafe extern "system" fn snap_proc(_: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK, _: u32, w: HWND, id: i32, _: i32, _: u32, _: u32) {
-    if id != 0 || w.is_null() || IsWindowVisible(w) == 0 || GetWindowLongW(w, GWL_STYLE) as u32 & WS_THICKFRAME == 0 || IsZoomed(w) != 0 {
+unsafe extern "system" fn snap_proc(_: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK, ev: u32, w: HWND, id: i32, _: i32, _: u32, _: u32) {
+    if id != 0 || w.is_null() {
+        return;
+    }
+    if ev == 0x000A {
+        // the drag starts: its size, so that the end can tell a move (magnet) from a resize (left alone)
+        let r = frame(w);
+        DRAG_SIZE.set((r.right - r.left, r.bottom - r.top));
+        return;
+    }
+    if IsWindowVisible(w) == 0 || IsZoomed(w) != 0 {
+        return;
+    }
+    if stick() && !edge_snap(w) {
+        let r = frame(w);
+        if DRAG_SIZE.get() == (r.right - r.left, r.bottom - r.top) {
+            magnet_window(w, r);
+        }
+        return;
+    }
+    if GetWindowLongW(w, GWL_STYLE) as u32 & WS_THICKFRAME == 0 {
         return;
     }
     let mut pt: POINT = zeroed();
@@ -2556,6 +2656,84 @@ unsafe extern "system" fn snap_proc(_: windows_sys::Win32::UI::Accessibility::HW
         SetWindowPos(w, null_mut(), a.left, a.top, half, a.bottom - a.top, SWP_NOZORDER | SWP_NOACTIVATE);
     } else if pt.x >= m.right - 2 {
         SetWindowPos(w, null_mut(), a.left + half, a.top, half, a.bottom - a.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+// ---------- window magnet (#133): a dragged window that ends near a screen edge or another window's edge sticks to it ----------
+
+thread_local! {
+    static DRAG_SIZE: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+}
+static STICK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0xFF); // 0 off, 1 on, 0xFF not read yet
+
+fn stick_file() -> PathBuf {
+    appdata_file("topbar-stick.txt")
+}
+
+pub(crate) fn stick() -> bool {
+    if STICK.load(Relaxed) == 0xFF {
+        STICK.store(std::fs::read_to_string(stick_file()).is_ok_and(|s| s.trim() == "1") as u8, Relaxed);
+    }
+    STICK.load(Relaxed) == 1
+}
+
+pub(crate) fn set_stick(on: bool) {
+    STICK.store(on as u8, Relaxed);
+    let _ = std::fs::write(stick_file(), if on { "1" } else { "0" });
+}
+
+/// Would the edge snap above take this drop (the pointer on a screen edge)?
+unsafe fn edge_snap(w: HWND) -> bool {
+    let mut pt: POINT = zeroed();
+    GetCursorPos(&mut pt);
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi) != 0
+        && GetWindowLongW(w, GWL_STYLE) as u32 & WS_THICKFRAME != 0
+        && (pt.y <= mi.rcMonitor.top + 1 || pt.x <= mi.rcMonitor.left + 1 || pt.x >= mi.rcMonitor.right - 2)
+}
+
+/// The window's visible frame (without the invisible resize borders Windows 10/11 add around it).
+unsafe fn frame(w: HWND) -> RECT {
+    let mut r: RECT = zeroed();
+    if DwmGetWindowAttribute(w, 9, &mut r as *mut _ as *mut _, size_of::<RECT>() as u32) != 0 {
+        GetWindowRect(w, &mut r); // DWMWA_EXTENDED_FRAME_BOUNDS failed
+    }
+    r
+}
+
+/// How far to move `r` so that its nearest edge within `d` px lands on one of the edges (0 when none is that close).
+/// `xs`/`ys`: the vertical / horizontal lines it may stick to.
+fn magnet(r: RECT, xs: &[i32], ys: &[i32], d: i32) -> (i32, i32) {
+    let best = |a: i32, b: i32, es: &[i32]| es.iter().flat_map(|&e| [e - a, e - b]).filter(|v| v.abs() <= d).min_by_key(|v| v.abs()).unwrap_or(0);
+    (best(r.left, r.right, xs), best(r.top, r.bottom, ys))
+}
+
+unsafe fn magnet_window(w: HWND, r: RECT) {
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+        return;
+    }
+    let a = mi.rcWork;
+    let (mut xs, mut ys) = (vec![a.left, a.right], vec![a.top, a.bottom]);
+    // the other windows' edges: only those beside this one (overlapping along the other axis), so a far window does not pull
+    let mut v: Vec<HWND> = Vec::new();
+    EnumWindows(Some(collect), &mut v as *mut _ as LPARAM);
+    for o in v.into_iter().filter(|&o| o != w && IsIconic(o) == 0 && IsZoomed(o) == 0) {
+        let f = frame(o);
+        if f.top < r.bottom && f.bottom > r.top {
+            xs.extend([f.left, f.right]);
+        }
+        if f.left < r.right && f.right > r.left {
+            ys.extend([f.top, f.bottom]);
+        }
+    }
+    let (dx, dy) = magnet(r, &xs, &ys, sc(14));
+    if (dx, dy) != (0, 0) {
+        let mut wr: RECT = zeroed();
+        GetWindowRect(w, &mut wr);
+        SetWindowPos(w, null_mut(), wr.left + dx, wr.top + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -2640,6 +2818,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
             });
         }
         SHOWDESK if left => winrust_common::desktop::toggle(),
+        POW_R | POW_S if left => power_click(h),
         GEAR => style_menu(),
         TAPP..=-900 => {
             let slot = (h - TAPP) as usize;
@@ -2722,6 +2901,7 @@ unsafe fn tip_cx(l: &Layout, h: i32) -> i32 {
         TASKVIEW => l.x0 + (l.bw + l.gap) + l.bw / 2,
         CLOCK => (l.clock.0 + l.clock.1) / 2,
         SHOWDESK => l.clock.1 + sc(3),
+        POW_R | POW_S => l.power.0 + POWER_KEYS.iter().position(|&k| k == h).unwrap_or(0) as i32 * sc(32) + sc(16),
         LANG => l.sys.0 + sc(21),
         WIFI_I => l.sys.0 + sc(58),
         VOL_I => l.sys.0 + sc(90),
@@ -2813,6 +2993,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         ALT_TAB => alt_tab(wp == 1),
         WIN_NUM => win_num(wp),
         WIN_X => start_menu(),
+        WIN_V => {
+            let (x, w) = bar_x_w();
+            hist::show(hwnd, x + w / 2);
+        }
+        0x031D => hist::on_update(hwnd), // WM_CLIPBOARDUPDATE
         NEXT_LANG => next_lang(hwnd, wp == 1),
         ALT_UP if wp == 2 => alt_close(),
         ALT_UP => alt_done(wp == 1),
@@ -2986,6 +3171,10 @@ fn main() {
         HOST.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, tc.as_ptr(), null(), WS_POPUP, 0, 0, 0, 0, null_mut(), null_mut(), hi, null()));
         // The bar may run elevated while apps and explorer do not; UIPI would drop their messages to us (icon data, appbar callbacks).
         ChangeWindowMessageFilterEx(HOST.get(), WM_COPYDATA, MSGFLT_ALLOW, null_mut());
+        // ITaskbarList::HrInit reads the task band from this property of the first Shell_TrayWnd, which is ours: without it
+        // HrInit failed (E_NOTIMPL) for every app while the bar ran. DeleteTab / AddTab then come here (tray_proc).
+        SetPropW(HOST.get(), wide("TaskbandHWND").as_ptr(), HOST.get());
+        ChangeWindowMessageFilterEx(HOST.get(), SH_MSG.get(), MSGFLT_ALLOW, null_mut());
         ChangeWindowMessageFilterEx(hwnd, CALLBACK, MSGFLT_ALLOW, null_mut());
         ChangeWindowMessageFilterEx(hwnd, TB_MSG.get(), MSGFLT_ALLOW, null_mut()); // explorer restarted (it runs unelevated)
         // files dragged from a normal-rights app onto the (elevated) bar: Start button = add to Start, elsewhere = pin
@@ -3023,9 +3212,10 @@ fn main() {
         announce(); // apps already running re-add their icons to us
         SetTimer(hwnd, 1, 1000, None); // status poll; windows come from win_event
         BAR.store(hwnd as isize, Relaxed);
+        hist::init(hwnd);
         bar_anim(hwnd); // the bar slides in (it starts hidden above the screen)
         SetTimer(hwnd, 3, 250, None); // fullscreen watch
-        windows_sys::Win32::UI::Accessibility::SetWinEventHook(0x000B, 0x000B, null_mut(), Some(snap_proc), 0, 0, 0); // EVENT_SYSTEM_MOVESIZEEND
+        windows_sys::Win32::UI::Accessibility::SetWinEventHook(0x000A, 0x000B, null_mut(), Some(snap_proc), 0, 0, 0); // EVENT_SYSTEM_MOVESIZESTART..END
         // foreground, minimize start/end, create..hide, name, cloaked/uncloaked (2 = WINEVENT_SKIPOWNPROCESS). Not
         // LOCATIONCHANGE: it fires for every caret and cursor move; a fullscreen switch comes as ABN_FULLSCREENAPP and the 1 s tick
         for (a, b) in [(0x0003, 0x0003), (0x0016, 0x0017), (0x8000, 0x8003), (0x800C, 0x800C), (0x8017, 0x8018)] {
@@ -3061,6 +3251,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn magnet_picks_the_nearest_edge_within_reach() {
+        let r = windows_sys::Win32::Foundation::RECT { left: 105, top: 50, right: 505, bottom: 350 };
+        assert_eq!(super::magnet(r, &[100, 900], &[0, 1000], 14), (-5, 0)); // left edge to 100
+        assert_eq!(super::magnet(r, &[512, 100], &[], 14), (-5, 0)); // 105->100 (5) beats 505->512 (7)
+        assert_eq!(super::magnet(r, &[515], &[340], 14), (10, -10)); // right edge to 515, bottom to 340
+        assert_eq!(super::magnet(r, &[130, 0], &[80], 14), (0, 0)); // nothing close enough
+    }
+
+    #[test]
     fn a_far_off_appbar_edge_goes_back_to_the_screen_edge() {
         assert_eq!(super::sane_edge(48, 1080), 48); // another bar below ours: stack above it
         assert_eq!(super::sane_edge(540, 1080), 0); // half the screen (#106)
@@ -3091,6 +3290,15 @@ mod tests {
         assert!(at(-1, true) == Link::Cable);
         assert!(at(-1, false) == Link::Offline); // nothing at all: the crossed-out wifi icon
         assert_eq!((arcs_lit(0), arcs_lit(40), arcs_lit(100)), (1, 2, 3));
+    }
+
+    #[test]
+    fn file_manager_windows_belong_to_the_file_explorer_pin() {
+        use super::as_pinned_exe;
+        let (rx, ex) = (r"c:\program files\rust-explorer\rust-explorer.exe", r"c:\windows\explorer.exe");
+        assert_eq!(as_pinned_exe(rx, ex, true), ex); // the pin the user clicks gets the windows
+        assert_eq!(as_pinned_exe(rx, ex, false), rx); // no such pin: the file manager's own pin keeps them
+        assert_eq!(as_pinned_exe(r"c:\tools\other.exe", ex, true), r"c:\tools\other.exe");
     }
 
     #[test]

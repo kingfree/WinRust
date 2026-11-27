@@ -29,6 +29,7 @@ O instalador abre em inglês. A lista de idiomas fica no canto dele — English,
 ## Remoção
 
 - **Remover tudo** na janela do instalador desfaz tudo: a Pesquisa do Windows, a barra de tarefas, o Explorer e os serviços voltam.
+- Sem o instalador (por exemplo, se o antivírus o apagou): **Configurações → Aplicativos → Aplicativos instalados → WinRust → Desinstalar** faz o mesmo que Remover WinRust.
 - Um plugin por vez: `plugin-launcher uninstall <plugin>` (veja [Linha de comando](#linha-de-comando)).
 - **Se a tela ficar sem barra de tarefas ou área de trabalho:** pressione Ctrl+Alt+Del → Gerenciador de Tarefas → Executar nova tarefa → `explorer.exe`, depois execute o instalador e clique em Remover tudo.
 

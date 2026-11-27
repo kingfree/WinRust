@@ -54,6 +54,7 @@ The installer is in English. Its corner holds a language drop-down — English, 
 ## Remove
 
 - **Remove WinRust** on the installer's first page undoes everything: Windows Search, the taskbar, Explorer and the services come back.
+- Without the installer (for example, antivirus deleted it): **Settings → Apps → Installed apps → WinRust → Uninstall** does the same as Remove WinRust.
 - One plugin at a time: `plugin-launcher uninstall <plugin>` (see [Command line](#command-line)).
 - **If the screen is left without a taskbar or desktop:** press Ctrl+Alt+Del → Task Manager → Run new task → `explorer.exe`, then run the installer and press Remove WinRust.
 

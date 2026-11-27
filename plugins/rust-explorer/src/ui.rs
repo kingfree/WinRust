@@ -463,7 +463,7 @@ pub fn gdiplus_start() {
 }
 
 /// Fills `r` (right / bottom exclusive) in `c`; `rad` > 0 rounds the corners (rad = corner diameter), anti-aliased.
-unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
+pub(crate) unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
     let rad = if winrust_common::style::style().square() { 0 } else { rad };
     use windows_sys::Win32::Graphics::GdiPlus::*;
     let (wd, ht) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
@@ -500,7 +500,7 @@ unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
     GdipDeleteGraphics(g);
 }
 
-unsafe fn text(dc: HDC, s: &str, mut r: RECT, c: u32, flags: u32) {
+pub(crate) unsafe fn text(dc: HDC, s: &str, mut r: RECT, c: u32, flags: u32) {
     SetTextColor(dc, c);
     DrawTextW(dc, w(s).as_ptr(), -1, &mut r, flags | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
 }

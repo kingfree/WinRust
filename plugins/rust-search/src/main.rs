@@ -262,11 +262,22 @@ fn scan(h: HANDLE) -> Result<Index, String> {
 fn journal(h: HANDLE) -> Result<USN_JOURNAL_DATA_V0, String> {
     let mut j: USN_JOURNAL_DATA_V0 = unsafe { std::mem::zeroed() };
     let mut n = 0u32;
-    let ok = unsafe {
-        DeviceIoControl(h, FSCTL_QUERY_USN_JOURNAL, ptr::null(), 0, &mut j as *mut _ as _, size_of::<USN_JOURNAL_DATA_V0>() as u32, &mut n, ptr::null_mut())
+    let query = |j: &mut USN_JOURNAL_DATA_V0, n: &mut u32| unsafe {
+        DeviceIoControl(h, FSCTL_QUERY_USN_JOURNAL, ptr::null(), 0, j as *mut _ as _, size_of::<USN_JOURNAL_DATA_V0>() as u32, n, ptr::null_mut()) != 0
     };
-    if ok == 0 {
-        return Err(format!("USN journal not available (error {})", unsafe { GetLastError() }));
+    if query(&mut j, &mut n) {
+        return Ok(j);
+    }
+    let err = unsafe { GetLastError() };
+    if err != ERROR_JOURNAL_NOT_ACTIVE {
+        return Err(format!("USN journal not available (error {err})"));
+    }
+    // A drive nobody asked for one yet (a games or data disk) has none and the search used to give up on it. Made with
+    // Windows' own default size (32 MB, grown 8 MB at a time), as its indexer would; nothing else on the drive changes.
+    let create = CREATE_USN_JOURNAL_DATA { MaximumSize: 32 << 20, AllocationDelta: 8 << 20 };
+    let made = unsafe { DeviceIoControl(h, FSCTL_CREATE_USN_JOURNAL, &create as *const _ as _, size_of::<CREATE_USN_JOURNAL_DATA>() as u32, ptr::null_mut(), 0, &mut n, ptr::null_mut()) != 0 };
+    if !made || !query(&mut j, &mut n) {
+        return Err(format!("USN journal not available and could not be made (error {})", unsafe { GetLastError() }));
     }
     Ok(j)
 }

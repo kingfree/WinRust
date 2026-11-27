@@ -916,6 +916,7 @@ impl App {
                 let on = {
                     let mut d = self.data.borrow_mut();
                     d.cfg.to_tray = !d.cfg.to_tray;
+                    d.cfg.tray_asked = true;
                     d.cfg.to_tray
                 };
                 self.toast(if on { t!("Закрытие окна будет сворачивать в трей", "Closing the window will minimize to tray", ja: "ウィンドウを閉じるとトレイに最小化されます", pt: "Fechar a janela vai minimizar para a bandeja", zh: "关闭窗口将最小化到托盘") } else { t!("Закрытие окна завершит программу", "Closing the window will quit the program", ja: "ウィンドウを閉じるとプログラムが終了します", pt: "Fechar a janela vai encerrar o programa", zh: "关闭窗口将退出程序") });
@@ -1244,6 +1245,31 @@ impl App {
         // up to 5 s old from the tray: fresh numbers right away
         self.last_tick.set(Instant::now());
         self.tick();
+    }
+
+    /// The first close: keep running in the tray, or quit? `None` = cancelled, the window stays.
+    pub fn ask_tray(&self) -> Option<bool> {
+        let text = t!(
+            "Оставить диспетчер задач работать в трее при закрытии окна?\n\nВ трее он продолжает собирать историю и применять правила. Изменить это можно в настройках или в меню значка в трее.",
+            "Keep Task Manager running in the tray when you close the window?\n\nIn the tray it keeps collecting history and applying rules. You can change this later in Settings or in the tray icon's menu.",
+            ja: "ウィンドウを閉じたときにタスク マネージャーをトレイで動作させたままにしますか?\n\nトレイでは履歴の収集とルールの適用を続けます。この設定は後で [設定] またはトレイ アイコンのメニューで変更できます。",
+            pt: "Manter o Gerenciador de Tarefas em execução na bandeja ao fechar a janela?\n\nNa bandeja ele continua coletando o histórico e aplicando as regras. Você pode mudar isso depois em Configurações ou no menu do ícone da bandeja.",
+            zh: "关闭窗口时让任务管理器继续在托盘中运行吗？\n\n在托盘中它会继续收集历史记录并执行规则。以后可以在设置或托盘图标的菜单中更改。"
+        );
+        let title = t!("Диспетчер задач", "Task Manager", ja: "タスク マネージャー", pt: "Gerenciador de Tarefas", zh: "任务管理器");
+        let w = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let h = self.win.handle.hwnd().unwrap_or(std::ptr::null_mut());
+        let to_tray = match unsafe { MessageBoxW(h, w(text).as_ptr(), w(title).as_ptr(), MB_YESNOCANCEL | MB_ICONQUESTION) } {
+            IDYES => true,
+            IDNO => false,
+            _ => return None,
+        };
+        {
+            let mut d = self.data.borrow_mut();
+            d.cfg.to_tray = to_tray;
+            d.cfg.tray_asked = true;
+        }
+        Some(to_tray)
     }
 
     pub fn quit(&self) {
